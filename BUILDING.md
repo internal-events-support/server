@@ -98,8 +98,12 @@ Windows builds fetch PortAudio automatically; optionally set `-DPROAUDIO_ASIO_SD
 to a locally obtained ASIO SDK root to enable ASIO.
 
 The proaudio `BUFFER_SIZE` / `buffer-size` setting is clamped to 16..65536 frames when
-positive; otherwise the driver chooses the size. Initialization failures or stalled
-audio callbacks remove the consumer so the channel can fall back to another clock.
+positive; otherwise the driver chooses the size. Initialization failures remove the
+consumer so the channel can fall back to another clock. If the audio callback stalls, the
+consumer stays and paces the channel at frame rate until the callback resumes.
+
+On Windows, `tools\windows\build.bat` passes the `CASPARCG_CMAKE_ARGS` environment variable
+to CMake, so these options can be set without editing the script.
 
 -DUSE_STATIC_BOOST=ON - (Linux only, default OFF) statically link against Boost.
 

@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -46,6 +47,10 @@ class frame_ring_buffer
     }
 
     std::size_t channels() const { return channels_; }
+
+    // Whole frames currently queued. Safe from either side, but may be out of date by the time it
+    // returns if the other side is running.
+    std::size_t size() const { return write_.load(std::memory_order_acquire) - read_.load(std::memory_order_acquire); }
 
     // Called only from whichever side owns writing (see class comment). Never blocks/allocates.
     // Returns the number of whole frames actually written (less than requested if full).

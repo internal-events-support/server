@@ -47,6 +47,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace caspar { namespace proaudio {
@@ -86,7 +87,11 @@ struct proaudio_consumer : public core::frame_consumer
     std::atomic<bool>                  device_underflow_{false};
     std::atomic<bool>                  stop_{false};
     std::atomic<bool>                  failed_{false};
+    std::atomic<bool>                  stalled_{false};
     std::chrono::duration<double>      playback_timeout_{0};
+
+    std::size_t preroll_samples_ = 0; // cushion the ring is topped back up to after an underrun
+    std::size_t max_fill_samples_ = 0; // a frame arriving when the ring is fuller than this is dropped
 
     executor executor_{L"proaudio_consumer"};
 
@@ -111,6 +116,7 @@ struct proaudio_consumer : public core::frame_consumer
         graph_->set_color("frame-time", color(0.1, 1.0, 0.1));
         graph_->set_color("drop-out", color(0.6, 0.3, 0.3));
         graph_->set_color("device-underflow", color(0.6, 0.3, 0.9));
+        graph_->set_color("stalled", color(1.0, 0.2, 0.2));
         diagnostics::register_graph(graph_);
     }
 
@@ -133,6 +139,7 @@ struct proaudio_consumer : public core::frame_consumer
                 dropout_.store(false, std::memory_order_relaxed);
                 device_underflow_.store(false, std::memory_order_relaxed);
                 failed_.store(false, std::memory_order_release);
+                stalled_.store(false, std::memory_order_release);
                 format_desc_   = format_desc;
                 channel_index_ = channel_index;
                 graph_->set_text(print());
@@ -179,15 +186,25 @@ struct proaudio_consumer : public core::frame_consumer
                 }
 
                 auto num_silence = delay_.in_frames(format_desc_.fps);
-                num_silence      = std::clamp<int>(num_silence, 1, format_desc_.fps);
+                num_silence      = std::clamp<int>(num_silence, 1, static_cast<int>(format_desc_.fps));
 
                 auto max_cadence =
                     *std::max_element(format_desc_.audio_cadence.begin(), format_desc_.audio_cadence.end());
 
+                preroll_samples_ = static_cast<std::size_t>(num_silence) * max_cadence;
+
+                // The ring holds about the pre-roll when each frame arrives. Allow for a callback block
+                // still to come. If BUFFER_SIZE isn't set the block size is unknown, so allow a frame.
+                auto slack = buffer_size_frames_ > 0 ? std::max(static_cast<std::size_t>(max_cadence) / 2,
+                                                                static_cast<std::size_t>(max_frames_per_callback_))
+                                                     : static_cast<std::size_t>(max_cadence);
+                max_fill_samples_ = preroll_samples_ + slack;
+
                 // At least double the largest block PortAudio's callback can ask for in one go, so an
                 // oversized host-requested block can't drain the ring dry and report a false dropout.
-                auto ring_capacity = std::max<std::size_t>(static_cast<std::size_t>(num_silence + 4) * max_cadence,
-                                                           static_cast<std::size_t>(max_frames_per_callback_) * 2);
+                auto ring_capacity = std::max<std::size_t>({static_cast<std::size_t>(num_silence + 4) * max_cadence,
+                                                            static_cast<std::size_t>(max_frames_per_callback_) * 2,
+                                                            max_fill_samples_ + max_cadence});
 
                 ring_ = std::make_unique<frame_ring_buffer>(ring_capacity, channel_map_.size());
                 scratch_.resize(max_frames_per_callback_ * channel_map_.size());
@@ -270,15 +287,31 @@ struct proaudio_consumer : public core::frame_consumer
                 }
             }
 
-            auto written = ring_->push(out.data(), static_cast<std::size_t>(num_samples));
-            if (written < static_cast<std::size_t>(num_samples))
-                dropout_.store(true, std::memory_order_relaxed);
+            // An underrun also uses up the pre-roll, for example when the driver starts before the
+            // first frame arrives. Without topping it back up, every later frame would arrive as the
+            // ring empties and risk a gap.
+            auto dropout = dropout_.exchange(false, std::memory_order_relaxed);
+            auto fill    = ring_->size();
+            if (dropout && fill < preroll_samples_) {
+                auto                      missing = preroll_samples_ - fill;
+                std::vector<std::int16_t> silence(missing * n_map, 0);
+                ring_->push(silence.data(), missing);
+                fill = ring_->size();
+            }
+
+            // Audio queued during a stall would otherwise stay late for good, so drop this frame if
+            // the ring is already fuller than normal. That brings the delay back down.
+            if (fill > max_fill_samples_)
+                dropout = true;
+            else if (ring_->push(out.data(), static_cast<std::size_t>(num_samples)) <
+                     static_cast<std::size_t>(num_samples))
+                dropout = true;
 
             auto target = frames_played_.load(std::memory_order_acquire) + static_cast<std::uint64_t>(num_samples);
 
             graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
             tick_timer_.restart();
-            if (dropout_.exchange(false, std::memory_order_relaxed))
+            if (dropout)
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "drop-out");
             if (device_underflow_.exchange(false, std::memory_order_relaxed))
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "device-underflow");
@@ -290,18 +323,30 @@ struct proaudio_consumer : public core::frame_consumer
             // Block until the executor task above has actually computed the target - only then do
             // we know how many played-frames to wait for.
             auto target = target_future.get();
-            auto deadline = std::chrono::steady_clock::now() + playback_timeout_;
+
+            // This consumer is the channel's clock, so a stalled driver must not stop or remove it:
+            // the channel would lose its audio until a restart over a brief driver hiccup. While
+            // stalled, pace the channel at frame rate instead and rejoin when the callback returns.
+            auto wait = stalled_.load(std::memory_order_acquire) ? std::chrono::duration<double>(1.0 / format_desc_.hz)
+                                                                 : playback_timeout_;
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::duration_cast<std::chrono::steady_clock::duration>(wait);
 
             while (!stop_ && !failed_.load(std::memory_order_acquire)) {
                 if (frames_played_.load(std::memory_order_acquire) >= target) {
+                    if (stalled_.exchange(false, std::memory_order_acq_rel))
+                        CASPAR_LOG(info) << print() << " PortAudio callback resumed.";
                     graph_->set_value("frame-time", frame_timer_.elapsed() * format_desc_.fps * 0.5);
                     frame_timer_.restart();
                     return true;
                 }
                 if (std::chrono::steady_clock::now() >= deadline) {
-                    CASPAR_LOG(error) << print() << " PortAudio callback stalled; removing consumer.";
-                    failed_.store(true, std::memory_order_release);
-                    return false;
+                    if (!stalled_.exchange(true, std::memory_order_acq_rel)) {
+                        CASPAR_LOG(error) << print() << " PortAudio callback stalled; keeping channel running.";
+                        graph_->set_tag(diagnostics::tag_severity::WARNING, "stalled");
+                    }
+                    frame_timer_.restart();
+                    return true;
                 }
                 std::this_thread::sleep_for(100us);
             }
