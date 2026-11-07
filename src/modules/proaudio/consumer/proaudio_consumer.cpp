@@ -92,6 +92,11 @@ struct proaudio_consumer : public core::frame_consumer
     std::atomic<bool>                  stalled_{false};
     std::chrono::duration<double>      playback_timeout_{0};
 
+    // Only touched on the executor thread.
+    std::uint64_t next_target_        = 0; // frames_played_ value the next frame should wait for
+    int           frames_since_log_   = 0;
+    int           dropouts_since_log_ = 0;
+
     std::size_t preroll_samples_ = 0; // cushion the ring is topped back up to after an underrun
     std::size_t max_fill_samples_ = 0; // a frame arriving when the ring is fuller than this is dropped
 
@@ -148,6 +153,9 @@ struct proaudio_consumer : public core::frame_consumer
                 device_underflow_.store(false, std::memory_order_relaxed);
                 failed_.store(false, std::memory_order_release);
                 stalled_.store(false, std::memory_order_release);
+                next_target_        = 0;
+                frames_since_log_   = 0;
+                dropouts_since_log_ = 0;
                 format_desc_   = format_desc;
                 channel_index_ = channel_index;
                 graph_->set_text(print());
@@ -315,12 +323,32 @@ struct proaudio_consumer : public core::frame_consumer
                      static_cast<std::size_t>(num_samples))
                 dropout = true;
 
-            auto target = frames_played_.load(std::memory_order_acquire) + static_cast<std::uint64_t>(num_samples);
+            // The target has to be a running total. Measuring each frame from the current position adds
+            // the channel's own time between frames to every frame, so the channel runs slow and starves
+            // the ring. Start again from the current position only after a stall or a long hold-up, so a
+            // resume doesn't wait for or rush through all the frames it missed.
+            auto       played    = frames_played_.load(std::memory_order_acquire);
+            const auto max_ahead = static_cast<std::uint64_t>(preroll_samples_) + 2 * static_cast<std::uint64_t>(num_samples);
+            const auto max_behind = static_cast<std::uint64_t>(format_desc_.audio_sample_rate);
+            if (next_target_ == 0 || stalled_.load(std::memory_order_acquire) || next_target_ > played + max_ahead ||
+                played > next_target_ + max_behind)
+                next_target_ = played;
+            next_target_ += static_cast<std::uint64_t>(num_samples);
+            auto target = next_target_;
 
             graph_->set_value("tick-time", tick_timer_.elapsed() * format_desc_.fps * 0.5);
             tick_timer_.restart();
-            if (dropout)
+            if (dropout) {
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "drop-out");
+                ++dropouts_since_log_;
+            }
+            if (++frames_since_log_ >= static_cast<int>(format_desc_.fps) * 10) {
+                if (dropouts_since_log_ > 0)
+                    CASPAR_LOG(warning) << print() << " " << dropouts_since_log_ << " drop-outs in the last "
+                                        << frames_since_log_ << " frames.";
+                frames_since_log_   = 0;
+                dropouts_since_log_ = 0;
+            }
             if (device_underflow_.exchange(false, std::memory_order_relaxed))
                 graph_->set_tag(diagnostics::tag_severity::WARNING, "device-underflow");
 
