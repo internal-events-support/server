@@ -71,6 +71,8 @@ struct proaudio_consumer : public core::frame_consumer
     int                        buffer_size_frames_; // <=0 means "let PortAudio/the driver choose"
     double                     latency_ms_;         // <0 means "use the device's default low latency"
 
+    std::unique_ptr<com_thread_scope> com_; // only touched on the executor thread
+
     PaStream* stream_          = nullptr;
     int       device_channels_ = 0; // width the stream was opened with
 
@@ -124,7 +126,10 @@ struct proaudio_consumer : public core::frame_consumer
     {
         stop_ = true;
 
-        executor_.invoke([this] { close_stream(); });
+        executor_.invoke([this] {
+            close_stream();
+            com_.reset();
+        });
     }
 
     // frame_consumer
@@ -135,6 +140,9 @@ struct proaudio_consumer : public core::frame_consumer
     {
         executor_.begin_invoke([this, format_desc, channel_index = channel_info.index] {
             try {
+                if (!com_)
+                    com_ = std::make_unique<com_thread_scope>();
+
                 close_stream();
                 dropout_.store(false, std::memory_order_relaxed);
                 device_underflow_.store(false, std::memory_order_relaxed);
@@ -236,13 +244,13 @@ struct proaudio_consumer : public core::frame_consumer
                 if (err != paNoError)
                     CASPAR_THROW_EXCEPTION(invalid_operation()
                                            << msg_info(std::string("Failed to open PortAudio stream: ") +
-                                                       Pa_GetErrorText(err)));
+                                                       error_text(err)));
 
                 err = Pa_StartStream(stream_);
                 if (err != paNoError)
                     CASPAR_THROW_EXCEPTION(invalid_operation()
                                            << msg_info(std::string("Failed to start PortAudio stream: ") +
-                                                       Pa_GetErrorText(err)));
+                                                       error_text(err)));
 
                 // Large driver buffers and device latency can exceed several video frame durations.
                 playback_timeout_ = std::chrono::duration<double>(
@@ -373,6 +381,18 @@ struct proaudio_consumer : public core::frame_consumer
     }
 
   private:
+    // "Unanticipated host error" says nothing on its own: the driver's actual error is held separately.
+    static std::string error_text(PaError err)
+    {
+        std::string text = Pa_GetErrorText(err);
+        if (err == paUnanticipatedHostError) {
+            if (auto host = Pa_GetLastHostErrorInfo())
+                text += std::string(" (host error ") + std::to_string(host->errorCode) + ": " +
+                        (host->errorText ? host->errorText : "") + ")";
+        }
+        return text;
+    }
+
     void close_stream()
     {
         if (!stream_)

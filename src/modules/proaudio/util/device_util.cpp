@@ -26,6 +26,13 @@
 #include <cctype>
 #include <sstream>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <objbase.h>
+#endif
+
 namespace caspar { namespace proaudio {
 
 std::string clean_name(const std::string& s)
@@ -126,6 +133,23 @@ std::shared_ptr<pa_library> pa_library::acquire()
         instance_ = shared = std::shared_ptr<pa_library>{new pa_library()};
 
     return shared;
+}
+
+com_thread_scope::com_thread_scope()
+{
+#ifdef _WIN32
+    // Apartment-threaded, the same as PortAudio's own COM setup. S_FALSE (already set up on this thread)
+    // still has to be balanced by CoUninitialize. Any failure is left for Pa_OpenStream to report.
+    initialized_ = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+#endif
+}
+
+com_thread_scope::~com_thread_scope()
+{
+#ifdef _WIN32
+    if (initialized_)
+        CoUninitialize();
+#endif
 }
 
 }} // namespace caspar::proaudio

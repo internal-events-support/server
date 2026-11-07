@@ -65,4 +65,19 @@ class pa_library
     static std::shared_ptr<pa_library> acquire();
 };
 
+// PortAudio only sets up COM on the thread that calls Pa_Initialize, but ASIO drivers are COM objects
+// loaded by Pa_OpenStream. Any other thread that opens a stream needs one of these for as long as the
+// stream is in use, and must destroy it on the same thread. Does nothing outside Windows.
+class com_thread_scope
+{
+    bool initialized_ = false;
+
+    com_thread_scope(const com_thread_scope&)            = delete;
+    com_thread_scope& operator=(const com_thread_scope&) = delete;
+
+  public:
+    com_thread_scope();
+    ~com_thread_scope();
+};
+
 }} // namespace caspar::proaudio
