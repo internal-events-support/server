@@ -57,6 +57,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
     const int               instance_no_;
     const std::wstring      name_;
     const bool              allow_fields_;
+    const bool              alpha_;
 
     core::video_format_desc              format_desc_;
     int                                  channel_index_;
@@ -80,11 +81,12 @@ struct newtek_ndi_consumer : public core::frame_consumer
     std::unique_ptr<NDIlib_send_instance_t, std::function<void(NDIlib_send_instance_t*)>> ndi_send_instance_;
 
   public:
-    newtek_ndi_consumer(std::wstring name, bool allow_fields)
+    newtek_ndi_consumer(std::wstring name, bool allow_fields, bool alpha)
         : name_(!name.empty() ? name : default_ndi_name())
         , instance_no_(instances_++)
         , frame_no_(0)
         , allow_fields_(allow_fields)
+        , alpha_(alpha)
         , channel_index_(0)
         , executor_(L"ndi_consumer[" + std::to_wstring(instance_no_) + L"]")
     {
@@ -127,7 +129,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
         ndi_video_frame_.yres                 = format_desc.height;
         ndi_video_frame_.frame_rate_N         = format_desc.framerate.numerator() * format_desc.field_count;
         ndi_video_frame_.frame_rate_D         = format_desc.framerate.denominator();
-        ndi_video_frame_.FourCC               = NDIlib_FourCC_type_BGRA;
+        ndi_video_frame_.FourCC               = alpha_ ? NDIlib_FourCC_type_BGRA : NDIlib_FourCC_type_BGRX;
         ndi_video_frame_.line_stride_in_bytes = format_desc.width * 4;
         ndi_video_frame_.frame_format_type    = NDIlib_frame_format_type_progressive;
 
@@ -270,7 +272,8 @@ create_ndi_consumer(const std::vector<std::wstring>&                         par
 
     std::wstring name         = get_param(L"NAME", params, L"");
     bool         allow_fields = contains_param(L"ALLOW_FIELDS", params);
-    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields);
+    bool         alpha        = contains_param(L"ALPHA", params);
+    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha);
 }
 
 spl::shared_ptr<core::frame_consumer>
@@ -281,11 +284,12 @@ create_preconfigured_ndi_consumer(const boost::property_tree::wptree&           
 {
     auto name         = ptree.get(L"name", L"");
     bool allow_fields = ptree.get(L"allow-fields", false);
+    bool alpha        = ptree.get(L"alpha", false);
 
     if (channel_info.depth != common::bit_depth::bit8)
         CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Newtek NDI consumer only supports 8-bit color depth."));
 
-    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields);
+    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha);
 }
 
 }} // namespace caspar::newtek
