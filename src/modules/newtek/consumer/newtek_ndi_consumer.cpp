@@ -58,6 +58,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
     const std::wstring      name_;
     const bool              allow_fields_;
     const bool              alpha_;
+    const bool              audio_;
 
     core::video_format_desc              format_desc_;
     int                                  channel_index_;
@@ -81,12 +82,13 @@ struct newtek_ndi_consumer : public core::frame_consumer
     std::unique_ptr<NDIlib_send_instance_t, std::function<void(NDIlib_send_instance_t*)>> ndi_send_instance_;
 
   public:
-    newtek_ndi_consumer(std::wstring name, bool allow_fields, bool alpha)
+    newtek_ndi_consumer(std::wstring name, bool allow_fields, bool alpha, bool audio)
         : name_(!name.empty() ? name : default_ndi_name())
         , instance_no_(instances_++)
         , frame_no_(0)
         , allow_fields_(allow_fields)
         , alpha_(alpha)
+        , audio_(audio)
         , channel_index_(0)
         , executor_(L"ndi_consumer[" + std::to_wstring(instance_no_) + L"]")
     {
@@ -185,11 +187,13 @@ struct newtek_ndi_consumer : public core::frame_consumer
                     graph_->set_value("ndi-tick", ndi_timer_.elapsed() * format_desc_.fps * 0.5);
                     ndi_timer_.restart();
                     frame_timer_.restart();
-                    auto audio_data             = frame.audio_data();
-                    int  audio_data_size        = static_cast<int>(audio_data.size());
-                    ndi_audio_frame_.no_samples = audio_data_size / format_desc_.audio_channels;
-                    ndi_audio_frame_.p_data     = const_cast<int*>(audio_data.data());
-                    ndi_lib_->util_send_send_audio_interleaved_32s(*ndi_send_instance_, &ndi_audio_frame_);
+                    if (audio_) {
+                        auto audio_data             = frame.audio_data();
+                        int  audio_data_size        = static_cast<int>(audio_data.size());
+                        ndi_audio_frame_.no_samples = audio_data_size / format_desc_.audio_channels;
+                        ndi_audio_frame_.p_data     = const_cast<int*>(audio_data.data());
+                        ndi_lib_->util_send_send_audio_interleaved_32s(*ndi_send_instance_, &ndi_audio_frame_);
+                    }
                     if (format_desc_.field_count == 2 && allow_fields_) {
                         ndi_video_frame_.frame_format_type =
                             (frame_no_ % 2 ? NDIlib_frame_format_type_field_1 : NDIlib_frame_format_type_field_0);
@@ -252,6 +256,7 @@ struct newtek_ndi_consumer : public core::frame_consumer
         core::monitor::state state;
         state["ndi/name"]         = name_;
         state["ndi/allow_fields"] = allow_fields_;
+        state["ndi/audio"]        = audio_;
         return state;
     }
 };
@@ -273,7 +278,8 @@ create_ndi_consumer(const std::vector<std::wstring>&                         par
     std::wstring name         = get_param(L"NAME", params, L"");
     bool         allow_fields = contains_param(L"ALLOW_FIELDS", params);
     bool         alpha        = contains_param(L"ALPHA", params);
-    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha);
+    bool         audio        = !contains_param(L"NO_AUDIO", params);
+    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha, audio);
 }
 
 spl::shared_ptr<core::frame_consumer>
@@ -285,11 +291,12 @@ create_preconfigured_ndi_consumer(const boost::property_tree::wptree&           
     auto name         = ptree.get(L"name", L"");
     bool allow_fields = ptree.get(L"allow-fields", false);
     bool alpha        = ptree.get(L"alpha", false);
+    bool audio        = ptree.get(L"audio", true);
 
     if (channel_info.depth != common::bit_depth::bit8)
         CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Newtek NDI consumer only supports 8-bit color depth."));
 
-    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha);
+    return spl::make_shared<newtek_ndi_consumer>(name, allow_fields, alpha, audio);
 }
 
 }} // namespace caspar::newtek
